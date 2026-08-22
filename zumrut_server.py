@@ -2,8 +2,8 @@ import asyncio
 import json
 import sqlite3
 import hashlib
+import os
 from datetime import datetime
-
 import websockets
 
 DB_PATH = "zumrut.db"
@@ -25,30 +25,20 @@ def init_db():
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS messages(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sender TEXT, channel TEXT, content TEXT,
-        msg_type TEXT, ts TEXT
+        sender TEXT, target TEXT, content TEXT, ts TEXT
     )""")
     conn.commit()
     conn.close()
 
 
-async def broadcast(payload):
-    dead = []
-    for user, ws in connected.items():
-        try:
-            await ws.send(json.dumps(payload))
-        except Exception:
-            dead.append(user)
-    for u in dead:
-        connected.pop(u, None)
-
-
-async def send_user_list():
+async def broadcast_user_list():
     users_list = list(connected.keys())
-    await broadcast({
-        "type": "user_list",
-        "users": users_list
-    })
+    payload = json.dumps({"type": "user_list", "users": users_list})
+    for ws in list(connected.values()):
+        try:
+            await ws.send(payload)
+        except Exception:
+            pass
 
 
 async def handler(websocket):
@@ -56,12 +46,11 @@ async def handler(websocket):
     try:
         async for raw in websocket:
             data = json.loads(raw)
-            action = data.get("action")
+            msg_type = data.get("type")
 
-            if action == "register":
-                u_name = data["username"].strip()
-                f_name = data["fullname"].strip()
-                p_word = data["password"]
+            if msg_type == "register":
+                u_name = data.get("username", "").strip()
+                p_word = data.get("password", "").strip()
 
                 conn = sqlite3.connect(DB_PATH)
                 c = conn.cursor()
@@ -70,86 +59,80 @@ async def handler(websocket):
                     await websocket.send(json.dumps({"type": "auth_res", "success": False, "msg": "Bu kullanıcı adı zaten alınmış!"}))
                 else:
                     c.execute("INSERT INTO users(username, fullname, password_hash) VALUES(?,?,?)",
-                              (u_name, f_name, hash_password(p_word)))
+                              (u_name, u_name, hash_password(p_word)))
                     conn.commit()
-                    await websocket.send(json.dumps({"type": "auth_res", "success": True, "msg": "Kayıt başarılı! Şimdi giriş yapabilirsiniz."}))
+                    await websocket.send(json.dumps({"type": "auth_res", "success": True, "msg": "Kayıt başarılı!"}))
                 conn.close()
 
-            elif action == "login":
-                u_name = data["username"].strip()
-                p_word = data["password"]
+            elif msg_type == "login":
+                u_name = data.get("username", "").strip()
+                p_word = data.get("password", "").strip()
 
                 conn = sqlite3.connect(DB_PATH)
                 c = conn.cursor()
                 c.execute("SELECT password_hash FROM users WHERE username=?", (u_name,))
                 row = c.fetchone()
+                
+                # Kullanıcı yoksa otomatik kayıt et (Kolay erişim için)
+                if not row:
+                    c.execute("INSERT INTO users(username, fullname, password_hash) VALUES(?,?,?)",
+                              (u_name, u_name, hash_password(p_word)))
+                    conn.commit()
+                    row = (hash_password(p_word),)
+
                 conn.close()
 
                 if row and row[0] == hash_password(p_word):
-                    if u_name in connected:
-                        await websocket.send(json.dumps({"type": "auth_res", "success": False, "msg": "Bu hesap zaten şu an çevrimiçi!"}))
-                    else:
-                        username = u_name
-                        connected[username] = websocket
-                        await websocket.send(json.dumps({"type": "auth_res", "success": True, "msg": "Giriş başarılı!"}))
-                        await send_user_list()
-                        await broadcast({
-                            "type": "presence",
-                            "user": username,
-                            "status": "online"
-                        })
+                    username = u_name
+                    connected[username] = websocket
+                    await websocket.send(json.dumps({"type": "auth_res", "success": True, "msg": "Giriş başarılı!"}))
+                    await broadcast_user_list()
                 else:
-                    await websocket.send(json.dumps({"type": "auth_res", "success": False, "msg": "Kullanıcı adı veya şifre hatalı!"}))
+                    await websocket.send(json.dumps({"type": "auth_res", "success": False, "msg": "Şifre hatalı!"}))
 
-            elif action == "message":
+            elif msg_type == "chat":
                 if not username:
                     continue
+                sender = username
+                target = data.get("target")
+                content = data.get("message")
                 ts = datetime.utcnow().strftime("%H:%M")
-                conn = sqlite3.connect(DB_PATH)
-                conn.execute(
-                    "INSERT INTO messages(sender,channel,content,msg_type,ts) VALUES(?,?,?,?,?)",
-                    (username, data.get("channel", "genel"), data["content"], data.get("msg_type", "text"), ts)
-                )
-                conn.commit()
-                conn.close()
 
-                await broadcast({
-                    "type": "message",
-                    "sender": username,
-                    "channel": data.get("channel", "genel"),
-                    "content": data["content"],
-                    "msg_type": data.get("msg_type", "text"),
+                out_payload = json.dumps({
+                    "type": "chat",
+                    "sender": sender,
+                    "target": target,
+                    "message": content,
                     "ts": ts
                 })
 
-            elif action == "status":
-                if not username:
-                    continue
-                conn = sqlite3.connect(DB_PATH)
-                conn.execute("UPDATE users SET status=? WHERE username=?", (data["status"], username))
-                conn.commit()
-                conn.close()
-                await broadcast({
-                    "type": "status",
-                    "user": username,
-                    "status": data["status"]
-                })
+                if target:
+                    # Özel mesaj (DM)
+                    if target in connected:
+                        await connected[target].send(out_payload)
+                    if sender in connected:
+                        await connected[sender].send(out_payload)
+                else:
+                    # Genel Mesaj
+                    for ws in list(connected.values()):
+                        try:
+                            await ws.send(out_payload)
+                        except Exception:
+                            pass
 
+    except Exception as e:
+        print(f"Hata: {e}")
     finally:
-        if username:
+        if username and username in connected:
             connected.pop(username, None)
-            await send_user_list()
-            await broadcast({
-                "type": "presence",
-                "user": username,
-                "status": "offline"
-            })
+            await broadcast_user_list()
 
 
 async def main():
     init_db()
-    async with websockets.serve(handler, "0.0.0.0", 8765):
-        print("Zümrüt Sunucusu Aktif: Port 8765")
+    port = int(os.environ.get("PORT", 8765))
+    async with websockets.serve(handler, "0.0.0.0", port):
+        print(f"Zümrüt Sunucusu Aktif: Port {port}")
         await asyncio.Future()
 
 if __name__ == "__main__":
