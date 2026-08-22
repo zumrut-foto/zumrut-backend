@@ -1,9 +1,6 @@
 services:
   - type: web
-    name: zumrut-server
+    name: zumrut-backend
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: python zumrut_server.py
-    envVars:
-      - key: PORT
-        value: 8765

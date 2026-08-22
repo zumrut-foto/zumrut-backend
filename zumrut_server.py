@@ -1,51 +1,82 @@
 import asyncio
 import json
+import os
 import sqlite3
 import hashlib
-import os
 from datetime import datetime
+
 import websockets
 
 DB_PATH = "zumrut.db"
 connected = {}  # username -> websocket
 
+
 def hash_password(password):
     return hashlib.sha256(password.encode('utf-8')).hexdigest()
+
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS users(
         username TEXT PRIMARY KEY,
-        password_hash TEXT
+        password_hash TEXT,
+        status TEXT DEFAULT 'available'
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS messages(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         sender TEXT, target TEXT, content TEXT, ts TEXT
     )""")
+    # Eski surumden kalan veritabanlarinda 'target' kolonu olmayabilir, ekle.
+    c.execute("PRAGMA table_info(messages)")
+    existing_cols = {row[1] for row in c.fetchall()}
+    if "target" not in existing_cols:
+        c.execute("ALTER TABLE messages ADD COLUMN target TEXT")
     conn.commit()
     conn.close()
 
-async def broadcast_user_list():
-    users_list = list(connected.keys())
-    payload = json.dumps({"type": "user_list", "users": users_list})
-    for ws in list(connected.values()):
+
+async def broadcast(payload, only_users=None):
+    """only_users=None -> herkese gonder. Aksi halde sadece verilen kullanici adlarina gonder."""
+    dead = []
+    targets = connected.items() if only_users is None else [
+        (u, ws) for u, ws in connected.items() if u in only_users
+    ]
+    for user, ws in targets:
         try:
-            await ws.send(payload)
+            await ws.send(json.dumps(payload))
         except Exception:
-            pass
+            dead.append(user)
+    for u in dead:
+        connected.pop(u, None)
+
+
+async def send_user_list():
+    users_list = list(connected.keys())
+    await broadcast({
+        "type": "user_list",
+        "users": users_list
+    })
+
 
 async def handler(websocket):
     username = None
     try:
         async for raw in websocket:
-            data = json.loads(raw)
-            msg_type = data.get("type")
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
 
-            # --- KAYIT OLMA ---
-            if msg_type == "register":
-                u_name = data.get("username", "").strip()
-                p_word = data.get("password", "").strip()
+            action = data.get("type")
+
+            if action == "register":
+                u_name = (data.get("username") or "").strip()
+                p_word = data.get("password") or ""
+
+                if not u_name or not p_word:
+                    await websocket.send(json.dumps({"type": "auth_res", "success": False, "msg": "Kullanıcı adı ve şifre gerekli!"}))
+                    continue
 
                 conn = sqlite3.connect(DB_PATH)
                 c = conn.cursor()
@@ -53,15 +84,15 @@ async def handler(websocket):
                 if c.fetchone():
                     await websocket.send(json.dumps({"type": "auth_res", "success": False, "msg": "Bu kullanıcı adı zaten alınmış!"}))
                 else:
-                    c.execute("INSERT INTO users(username, password_hash) VALUES(?,?)", (u_name, hash_password(p_word)))
+                    c.execute("INSERT INTO users(username, password_hash) VALUES(?,?)",
+                              (u_name, hash_password(p_word)))
                     conn.commit()
-                    await websocket.send(json.dumps({"type": "auth_res", "success": True, "msg": "Kayıt başarılı! Giriş yapabilirsiniz."}))
+                    await websocket.send(json.dumps({"type": "auth_res", "success": True, "msg": "Kayıt başarılı! Şimdi giriş yapabilirsiniz."}))
                 conn.close()
 
-            # --- GİRİŞ YAPMA ---
-            elif msg_type == "login":
-                u_name = data.get("username", "").strip()
-                p_word = data.get("password", "").strip()
+            elif action == "login":
+                u_name = (data.get("username") or "").strip()
+                p_word = data.get("password") or ""
 
                 conn = sqlite3.connect(DB_PATH)
                 c = conn.cursor()
@@ -69,55 +100,62 @@ async def handler(websocket):
                 row = c.fetchone()
                 conn.close()
 
-                if not row:
-                    await websocket.send(json.dumps({"type": "auth_res", "success": False, "msg": "Kullanıcı bulunamadı! Önce kayıt olun."}))
-                elif row[0] != hash_password(p_word):
-                    await websocket.send(json.dumps({"type": "auth_res", "success": False, "msg": "Hatalı şifre!"}))
-                elif u_name in connected:
-                    await websocket.send(json.dumps({"type": "auth_res", "success": False, "msg": "Bu kullanıcı zaten oturum açmış!"}))
+                if row and row[0] == hash_password(p_word):
+                    if u_name in connected:
+                        await websocket.send(json.dumps({"type": "auth_res", "success": False, "msg": "Bu hesap zaten şu an çevrimiçi!"}))
+                    else:
+                        username = u_name
+                        connected[username] = websocket
+                        await websocket.send(json.dumps({"type": "auth_res", "success": True, "msg": "Giriş başarılı!"}))
+                        await send_user_list()
+                        await broadcast({
+                            "type": "presence",
+                            "user": username,
+                            "status": "online"
+                        })
                 else:
-                    username = u_name
-                    connected[username] = websocket
-                    await websocket.send(json.dumps({"type": "auth_res", "success": True, "msg": "Giriş başarılı!"}))
-                    await broadcast_user_list()
+                    await websocket.send(json.dumps({"type": "auth_res", "success": False, "msg": "Kullanıcı adı veya şifre hatalı!"}))
 
-            # --- SOHBET / MESAJLAŞMA ---
-            elif msg_type == "chat":
+            elif action == "chat":
                 if not username:
                     continue
-                sender = username
+                message = data.get("message", "")
                 target = data.get("target")
-                content = data.get("message")
-                ts = datetime.now().strftime("%H:%M")
+                ts = datetime.utcnow().strftime("%H:%M")
 
-                out_payload = json.dumps({
+                conn = sqlite3.connect(DB_PATH)
+                conn.execute(
+                    "INSERT INTO messages(sender, target, content, ts) VALUES(?,?,?,?)",
+                    (username, target, message, ts)
+                )
+                conn.commit()
+                conn.close()
+
+                out = {
                     "type": "chat",
-                    "sender": sender,
+                    "sender": username,
+                    "message": message,
                     "target": target,
-                    "message": content,
                     "ts": ts
-                })
+                }
 
                 if target:
-                    # Özel Mesaj (DM)
-                    if target in connected:
-                        await connected[target].send(out_payload)
-                    if sender in connected:
-                        await connected[sender].send(out_payload)
+                    # Ozel mesaj: sadece gonderen ve alici gorur
+                    recipients = {username, target}
+                    await broadcast(out, only_users=recipients)
                 else:
-                    # Genel Chat
-                    for ws in list(connected.values()):
-                        try:
-                            await ws.send(out_payload)
-                        except Exception:
-                            pass
+                    await broadcast(out)
 
-    except Exception as e:
-        print(f"Hata: {e}")
     finally:
-        if username and username in connected:
+        if username:
             connected.pop(username, None)
-            await broadcast_user_list()
+            await send_user_list()
+            await broadcast({
+                "type": "presence",
+                "user": username,
+                "status": "offline"
+            })
+
 
 async def main():
     init_db()
